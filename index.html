@@ -441,6 +441,7 @@
         ];
 
         let transactions = JSON.parse(localStorage.getItem('bueno_excel_transactions_v3')) || defaultTransactions;
+        let lastLocalUpdate = parseInt(localStorage.getItem('bueno_last_update') || '0');
         
         let tokenClient;
         let gapiInited = false;
@@ -482,7 +483,7 @@
                         document.getElementById('authBtnLabel').innerText = 'Conectado';
                         document.getElementById('manualSyncBtn').classList.remove('hidden');
                         localStorage.setItem('bueno_drive_connected', 'true');
-                        await syncWithDrive(true);
+                        await syncWithDrive();
                     },
                 });
                 gsiInited = true;
@@ -518,6 +519,7 @@
             }
         }
 
+        // NOVA LÓGICA DE SINCRONIZAÇÃO INTELIGENTE
         async function syncWithDrive(userInitiated = false) {
             if (isSyncing || !gapiInited) return;
             
@@ -531,7 +533,7 @@
             updateSyncUI('syncing', 'Sincronizando...');
 
             try {
-                // Search for existing file named 'controle_bueno_data.json'
+                // Busca o arquivo no Drive
                 const response = await gapi.client.drive.files.list({
                     q: `name = '${SYNC_FILE_NAME}' and trashed = false`,
                     fields: 'files(id, name, modifiedTime)',
@@ -541,36 +543,44 @@
                 const files = response.result.files;
 
                 if (files && files.length > 0) {
-                    // Use the first found file ID
                     driveFileId = files[0].id;
+                    const cloudModifiedTime = new Date(files[0].modifiedTime).getTime();
 
-                    // Delete duplicate files if any exist to keep Drive clean
+                    // Limpa duplicados se existirem
                     if (files.length > 1) {
                         for (let i = 1; i < files.length; i++) {
-                            try {
-                                await gapi.client.drive.files.delete({ fileId: files[i].id });
-                            } catch(e) { console.warn("Erro ao remover duplicado:", e); }
+                            try { await gapi.client.drive.files.delete({ fileId: files[i].id }); } catch(e) {}
                         }
                     }
 
-                    // Download content from the cloud
-                    const fileResponse = await fetch(`https://www.googleapis.com/drive/v3/files/${driveFileId}?alt=media`, {
-                        headers: { 'Authorization': `Bearer ${currentToken}` }
-                    });
+                    // COMPARAÇÃO DE TIMESTAMPS
+                    if (cloudModifiedTime > lastLocalUpdate) {
+                        // Nuvem é mais recente: Baixar
+                        console.log("Cloud is newer. Downloading...");
+                        const fileResponse = await fetch(`https://www.googleapis.com/drive/v3/files/${driveFileId}?alt=media`, {
+                            headers: { 'Authorization': `Bearer ${currentToken}` }
+                        });
 
-                    if (fileResponse.ok) {
-                        const cloudData = await fileResponse.json();
-                        if (Array.isArray(cloudData)) {
-                            transactions = cloudData;
-                            saveToLocal();
-                            renderApp();
+                        if (fileResponse.ok) {
+                            const cloudData = await fileResponse.json();
+                            if (Array.isArray(cloudData)) {
+                                transactions = cloudData;
+                                // Atualiza o timestamp local para o da nuvem
+                                lastLocalUpdate = cloudModifiedTime;
+                                localStorage.setItem('bueno_last_update', lastLocalUpdate.toString());
+                                localStorage.setItem('bueno_excel_transactions_v3', JSON.stringify(transactions));
+                                renderApp();
+                            }
                         }
+                    } else if (lastLocalUpdate > cloudModifiedTime) {
+                        // Local é mais recente: Enviar
+                        console.log("Local is newer. Uploading...");
+                        await uploadToDrive(driveFileId, currentToken);
+                    } else {
+                        console.log("Data is already in sync.");
                     }
-
-                    // Upload local state to update the file on Drive
-                    await uploadToDrive(driveFileId, currentToken);
                 } else {
-                    // File doesn't exist yet, create a single named file
+                    // Arquivo não existe: Criar
                     await createDriveFile(currentToken);
                 }
 
@@ -585,15 +595,10 @@
 
         async function createDriveFile(token) {
             try {
-                // Create file metadata with explicit name
                 const createRes = await gapi.client.drive.files.create({
-                    resource: {
-                        name: SYNC_FILE_NAME,
-                        mimeType: 'application/json'
-                    },
+                    resource: { name: SYNC_FILE_NAME, mimeType: 'application/json' },
                     fields: 'id'
                 });
-
                 driveFileId = createRes.result.id;
                 await uploadToDrive(driveFileId, token);
             } catch (err) {
@@ -612,6 +617,9 @@
                     },
                     body: JSON.stringify(transactions)
                 });
+                // Atualiza o timestamp local após upload bem-sucedido
+                lastLocalUpdate = Date.now();
+                localStorage.setItem('bueno_last_update', lastLocalUpdate.toString());
             } catch (e) {
                 console.error("Erro no envio de dados ao Drive:", e);
             }
@@ -674,12 +682,15 @@
 
         function saveToLocal() {
             localStorage.setItem('bueno_excel_transactions_v3', JSON.stringify(transactions));
+            lastLocalUpdate = Date.now();
+            localStorage.setItem('bueno_last_update', lastLocalUpdate.toString());
         }
 
+        // DISPARA A SINCRONIZAÇÃO AUTOMÁTICA
         function persistData() {
             saveToLocal();
-            if (gapiInited && gapi.client.getToken() !== null && driveFileId) {
-                uploadToDrive(driveFileId);
+            if (gapiInited && gapi.client.getToken() !== null) {
+                syncWithDrive(); 
             }
         }
 
@@ -1073,6 +1084,14 @@
             updateSummary();
             updateCharts();
         }
+
+        // EVENTO DE FOCO: Verifica se há atualizações na nuvem quando o usuário volta para a aba
+        window.addEventListener('focus', () => {
+            if (gapiInited && gapi.client.getToken() !== null) {
+                console.log("Window focused. Checking for cloud updates...");
+                syncWithDrive();
+            }
+        });
 
         window.onload = function() {
             renderApp();
