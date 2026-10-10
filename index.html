@@ -59,8 +59,8 @@
                     <button id="authBtn" onclick="handleAuthClick()" class="ml-1 bg-indigo-600 hover:bg-indigo-500 text-white px-2.5 py-1 rounded-md text-[11px] font-semibold transition border border-indigo-400/30 flex items-center gap-1.5">
                         <i class="fa-brands fa-google-drive"></i> <span id="authBtnLabel">Conectar</span>
                     </button>
-                    <button id="manualSyncBtn" onclick="syncWithDrive()" class="hidden bg-indigo-950/60 hover:bg-indigo-900 text-indigo-200 p-1 rounded-md text-[11px] transition" title="Forçar Sincronização Agora">
-                        <i class="fa-solid fa-rotate"></i>
+                    <button id="manualSyncBtn" onclick="syncWithDrive(true)" class="hidden bg-indigo-950/60 hover:bg-indigo-900 text-indigo-200 px-2 py-1 rounded-md text-[11px] font-medium transition flex items-center gap-1" title="Sincronizar Agora com a Nuvem">
+                        <i class="fa-solid fa-rotate"></i> <span>Sincronizar</span>
                     </button>
                 </div>
 
@@ -423,7 +423,7 @@
     <script>
         const CLIENT_ID = '123452428513-87kct668ceenb205nhttju3r20apicae.apps.googleusercontent.com';
         const API_KEY = 'AIzaSyDfGBt7z7KC0YrMLpJoBzYo5_nXX8O4gjU';
-        const SCOPES = 'https://www.googleapis.com/auth/drive.appdata https://www.googleapis.com/auth/drive.file';
+        const SCOPES = 'https://www.googleapis.com/auth/drive.file';
         const DISCOVERY_DOC = 'https://www.googleapis.com/discovery/v1/apis/drive/v3/rest';
         const SYNC_FILE_NAME = 'controle_bueno_data.json';
 
@@ -482,7 +482,7 @@
                         document.getElementById('authBtnLabel').innerText = 'Conectado';
                         document.getElementById('manualSyncBtn').classList.remove('hidden');
                         localStorage.setItem('bueno_drive_connected', 'true');
-                        await syncWithDrive();
+                        await syncWithDrive(true);
                     },
                 });
                 gsiInited = true;
@@ -495,7 +495,9 @@
         function maybeEnableSync() {
             if (gapiInited && gsiInited) {
                 if (localStorage.getItem('bueno_drive_connected') === 'true') {
-                    updateSyncUI('ready', 'Drive Pronto');
+                    updateSyncUI('ready', 'Conectado (Drive)');
+                    document.getElementById('authBtnLabel').innerText = 'Conectado';
+                    document.getElementById('manualSyncBtn').classList.remove('hidden');
                     try {
                         tokenClient.requestAccessToken({ prompt: '' });
                     } catch(e) {
@@ -516,86 +518,102 @@
             }
         }
 
-        async function syncWithDrive() {
+        async function syncWithDrive(userInitiated = false) {
             if (isSyncing || !gapiInited) return;
+            
+            const currentToken = gapi.client.getToken() ? gapi.client.getToken().access_token : null;
+            if (!currentToken) {
+                updateSyncUI('disconnected', 'Conectar Drive');
+                return;
+            }
+
             isSyncing = true;
             updateSyncUI('syncing', 'Sincronizando...');
 
             try {
+                // Search for existing file named 'controle_bueno_data.json'
                 const response = await gapi.client.drive.files.list({
                     q: `name = '${SYNC_FILE_NAME}' and trashed = false`,
                     fields: 'files(id, name, modifiedTime)',
-                    spaces: 'appDataFolder,drive'
+                    spaces: 'drive'
                 });
 
                 const files = response.result.files;
 
                 if (files && files.length > 0) {
+                    // Use the first found file ID
                     driveFileId = files[0].id;
-                    const fileData = await gapi.client.drive.files.get({
-                        fileId: driveFileId,
-                        alt: 'media'
+
+                    // Delete duplicate files if any exist to keep Drive clean
+                    if (files.length > 1) {
+                        for (let i = 1; i < files.length; i++) {
+                            try {
+                                await gapi.client.drive.files.delete({ fileId: files[i].id });
+                            } catch(e) { console.warn("Erro ao remover duplicado:", e); }
+                        }
+                    }
+
+                    // Download content from the cloud
+                    const fileResponse = await fetch(`https://www.googleapis.com/drive/v3/files/${driveFileId}?alt=media`, {
+                        headers: { 'Authorization': `Bearer ${currentToken}` }
                     });
 
-                    if (fileData.result && Array.isArray(fileData.result)) {
-                        transactions = fileData.result;
-                        saveToLocal();
-                        renderApp();
-                    } else if (fileData.body) {
-                        try {
-                            const parsed = JSON.parse(fileData.body);
-                            if (Array.isArray(parsed)) {
-                                transactions = parsed;
-                                saveToLocal();
-                                renderApp();
-                            }
-                        } catch(e) {}
+                    if (fileResponse.ok) {
+                        const cloudData = await fileResponse.json();
+                        if (Array.isArray(cloudData)) {
+                            transactions = cloudData;
+                            saveToLocal();
+                            renderApp();
+                        }
                     }
-                    await uploadToDrive(driveFileId);
+
+                    // Upload local state to update the file on Drive
+                    await uploadToDrive(driveFileId, currentToken);
                 } else {
-                    await createDriveFile();
+                    // File doesn't exist yet, create a single named file
+                    await createDriveFile(currentToken);
                 }
 
                 updateSyncUI('synced', 'Sincronizado');
             } catch (err) {
                 console.error("Drive Sync Error:", err);
-                updateSyncUI('ready', 'Conectado (Drive)');
+                updateSyncUI('error', 'Erro Sync');
             } finally {
                 isSyncing = false;
             }
         }
 
-        async function createDriveFile() {
-            const fileMetadata = {
-                'name': SYNC_FILE_NAME,
-                'parents': ['appDataFolder']
-            };
-            const media = {
-                mimeType: 'application/json',
-                body: JSON.stringify(transactions)
-            };
+        async function createDriveFile(token) {
+            try {
+                // Create file metadata with explicit name
+                const createRes = await gapi.client.drive.files.create({
+                    resource: {
+                        name: SYNC_FILE_NAME,
+                        mimeType: 'application/json'
+                    },
+                    fields: 'id'
+                });
 
-            const response = await gapi.client.drive.files.create({
-                resource: fileMetadata,
-                media: media,
-                fields: 'id'
-            });
-
-            driveFileId = response.result.id;
+                driveFileId = createRes.result.id;
+                await uploadToDrive(driveFileId, token);
+            } catch (err) {
+                console.error("Erro ao criar arquivo no Drive:", err);
+            }
         }
 
-        async function uploadToDrive(fileId) {
-            if (!fileId) return;
+        async function uploadToDrive(fileId, token) {
+            if (!fileId || !token) return;
             try {
-                await gapi.client.request({
-                    path: `/upload/drive/v3/files/${fileId}`,
+                await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`, {
                     method: 'PATCH',
-                    params: { uploadType: 'media' },
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: {
+                        'Authorization': `Bearer ${token}`,
+                        'Content-Type': 'application/json'
+                    },
                     body: JSON.stringify(transactions)
                 });
             } catch (e) {
-                console.warn("Patch upload failed, attempting basic update", e);
+                console.error("Erro no envio de dados ao Drive:", e);
             }
         }
 
